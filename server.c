@@ -12,6 +12,7 @@
 
 #define BACKLOG 10
 #define CLIENTS_REQUIRED 3
+#define KEEP_ALIVE_INTERVAL 5
 
 #define ERR(source) ( fprintf(stderr, "%s:%d\n", __FILE__, __LINE__), \
                         perror(source), exit(EXIT_FAILURE) )
@@ -75,6 +76,44 @@ void regenerateBarrier(pthread_barrier_t *barrier)
         ERR("pthread_barrier_init");
 }
 
+size_t bulkRead(int fd, char *buffer, size_t length)
+{
+    char *buf = buffer;
+    size_t bytesLeft = length,
+        totalBytesRead = 0;
+    while (bytesLeft > 0)
+    {
+        ssize_t bytesRead = TEMP_FAILURE_RETRY(read(fd, buf, bytesLeft));
+        if (bytesRead <= 0)
+            break;
+
+        bytesLeft -= bytesRead;
+        totalBytesRead += bytesRead;
+        buf += bytesRead;
+    }
+
+    return totalBytesRead;
+}
+
+size_t bulkWrite(int fd, char *buffer, size_t length)
+{
+    char *buf = buffer;
+    size_t bytesLeft = length,
+        totalBytesWritten = 0;
+    while (bytesLeft > 0)
+    {
+        ssize_t bytesWritten = TEMP_FAILURE_RETRY(write(fd, buf, bytesLeft));
+        if (bytesWritten <= 0)
+            break;
+
+        bytesLeft -= bytesWritten;
+        totalBytesWritten += bytesWritten;
+        buf += bytesWritten;
+    }
+
+    return totalBytesWritten;
+}
+
 typedef struct workerArgs {
     int id;
     int clientSocket;
@@ -87,15 +126,61 @@ void *workerThread(void *args)
 {
     workerArgs_t *workerArgs = (workerArgs_t*)args;
     printf("[%d] Worker thread started\n", workerArgs->id);
+    char keepAliveMessage[] = "keep-alive\n";
+    int keepAliveLength = strlen(keepAliveMessage);
 
+    struct timespec keepAliveInterval;
+    keepAliveInterval.tv_sec = KEEP_ALIVE_INTERVAL;
+    keepAliveInterval.tv_nsec = 0;
+
+    int connectionBroken = 0;
+    while (1)
+    {
+        if (pthread_mutex_lock(workerArgs->mutex) != 0)
+            ERR("pthread_mutex_lock");
+        if (*(workerArgs->clientsConnected) == CLIENTS_REQUIRED)
+        {
+            if (pthread_mutex_unlock(workerArgs->mutex) != 0)
+                ERR("pthread_mutex_unlock");
+            break;
+        }
+        if (pthread_mutex_unlock(workerArgs->mutex) != 0)
+            ERR("pthread_mutex_unlock");
+
+        printf("[%d] sending keep-alive message to the client\n", workerArgs->id);
+        if (bulkWrite(workerArgs->clientSocket, keepAliveMessage, keepAliveLength) != keepAliveLength)
+        {
+            printf("[%d] connection broken\n", workerArgs->id);
+            connectionBroken = 1;
+            break;
+        }
+
+        struct timespec timeLeft = keepAliveInterval;
+        while (nanosleep(&timeLeft, &timeLeft) != 0)
+            continue;
+    }
+
+    if (!connectionBroken)
+    {
+        printf("[%d] sufficient number of clients reached\n", workerArgs->id);
+    }
+
+    // Barrier to synchronize closing of all clients
+    printf("[%d] Waiting at the barrier to synchronize closing\n", workerArgs->id);
+    int barrierResult = pthread_barrier_wait(workerArgs->barrier);
+    if (barrierResult != 0 && barrierResult != PTHREAD_BARRIER_SERIAL_THREAD)
+        ERR("pthread_barrier_wait");
     printf("[%d] Closing connection to the client\n", workerArgs->id);
     if (TEMP_FAILURE_RETRY(close(workerArgs->clientSocket)) < 0)
         ERR("close");
-    if (pthread_mutex_lock(workerArgs->mutex) != 0)
-        ERR("pthread_mutex_lock");
-    *(workerArgs->clientsConnected) = *(workerArgs->clientsConnected) - 1;
-    if (pthread_mutex_unlock(workerArgs->mutex) != 0)
-        ERR("pthread_mutex_unlock");
+    // Resetting clientsConnected is done in the main server thread
+    // if (pthread_mutex_lock(workerArgs->mutex) != 0)
+    //     ERR("pthread_mutex_lock");
+    // *(workerArgs->clientsConnected) = *(workerArgs->clientsConnected) - 1;
+    // printf("[%d] %d clients left\n", workerArgs->id, *(workerArgs->clientsConnected));
+    // if (pthread_mutex_unlock(workerArgs->mutex) != 0)
+    //     ERR("pthread_mutex_unlock");
+
     printf("[%d] terminated\n", workerArgs->id);
     free(args);
     return NULL;
@@ -115,7 +200,7 @@ int main(int argc, char **argv)
         clientsConnected = 0,
         nextWorkerId = 1;
     bindSocketAndListen(serverSocket, port);
-    printf("Server listening on port %d\n", port);
+    printf("[SERVER] listening on port %d\n", port);
 
     while (!shouldQuit)
     {
@@ -147,11 +232,11 @@ int main(int argc, char **argv)
             ERR("pthread_mutex_lock");
         clientsConnected++;
 
-        printf("New client connected\n");
+        printf("[SERVER] New client connected\n");
 
         if (clientsConnected < CLIENTS_REQUIRED)
         {
-            printf("Currently %d clients are connected\n", clientsConnected);
+            printf("[SERVER] Currently %d clients are connected\n", clientsConnected);
             if (pthread_mutex_unlock(&mutex) != 0)
                 ERR("pthread_mutex_unlock");
             continue;
@@ -160,11 +245,25 @@ int main(int argc, char **argv)
         if (pthread_mutex_unlock(&mutex) != 0)
                 ERR("pthread_mutex_unlock");
 
-        printf("All required clients connected\n");
+        printf("[SERVER] All required clients connected, waiting at the barrier for them to end\n");
+        int barrierResult = pthread_barrier_wait(&barrier);
+        if (barrierResult != 0 && barrierResult != PTHREAD_BARRIER_SERIAL_THREAD)
+            ERR("pthread_barrier_wait");
+
+        // No need to lock mutexes, because all threads are terminating right now (and won't modify
+        // shared data)
+        clientsConnected = 0;
+        if (pthread_barrier_destroy(&barrier) != 0)
+            ERR("pthread_barrier_destroy");
+        regenerateBarrier(&barrier);
+        printf("[SERVER] Barrier regenerated\n");
     }
 
+    printf("[SERVER] cleaning up\n");
+    if (pthread_barrier_destroy(&barrier) != 0)
+        ERR("pthread_barrier_destroy");
     if (TEMP_FAILURE_RETRY(close(serverSocket)) < 0)
         ERR("close");
-    printf("Server terminated\n");
+    printf("[SERVER] terminated\n");
     return EXIT_SUCCESS;
 }
