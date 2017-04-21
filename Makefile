@@ -1,5 +1,6 @@
 CC=gcc
-CFLAGS=-Wall
+CFLAGS=-Wall -std=gnu99
+LDLIBS= -lpthread
 
 .PHONY: clean
 
@@ -9,4 +10,4 @@ clean:
 	rm server
 
 server: server.c
-	$(CC) $(CFLAGS) $(LDLIBS) server.c -o server
+	$(CC) server.c -o server $(CFLAGS) $(LDLIBS)
