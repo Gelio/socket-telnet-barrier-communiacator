@@ -81,11 +81,22 @@ size_t bulkRead(int fd, char *buffer, size_t length)
     char *buf = buffer;
     size_t bytesLeft = length,
         totalBytesRead = 0;
-    while (bytesLeft > 0)
+    while (bytesLeft > 0 && !shouldQuit)
     {
         ssize_t bytesRead = TEMP_FAILURE_RETRY(read(fd, buf, bytesLeft));
-        if (bytesRead <= 0)
+        if (bytesRead == 0)
             break;
+        else if (bytesRead < 0)
+        {
+            if (errno == EINTR)
+            {
+                if (shouldQuit)
+                    break;
+                else
+                    continue;
+            }
+            ERR("read");
+        }
 
         bytesLeft -= bytesRead;
         totalBytesRead += bytesRead;
@@ -100,11 +111,22 @@ size_t bulkWrite(int fd, char *buffer, size_t length)
     char *buf = buffer;
     size_t bytesLeft = length,
         totalBytesWritten = 0;
-    while (bytesLeft > 0)
+    while (bytesLeft > 0 && !shouldQuit)
     {
-        ssize_t bytesWritten = TEMP_FAILURE_RETRY(write(fd, buf, bytesLeft));
-        if (bytesWritten <= 0)
+        ssize_t bytesWritten = write(fd, buf, bytesLeft);
+        if (bytesWritten == 0)
             break;
+        else if (bytesWritten < 0)
+        {
+            if (errno == EINTR)
+            {
+                if (shouldQuit)
+                    break;
+                else
+                    continue;
+            }
+            ERR("write");
+        }
 
         bytesLeft -= bytesWritten;
         totalBytesWritten += bytesWritten;
@@ -120,6 +142,9 @@ typedef struct workerArgs {
     pthread_mutex_t *mutex;
     int *clientsConnected;
     pthread_barrier_t *barrier;
+    pthread_cond_t *cond;
+    int *communicatingWithClient;
+    char *lastLetter;
 } workerArgs_t;
 
 void *workerThread(void *args)
@@ -163,6 +188,65 @@ void *workerThread(void *args)
     if (!connectionBroken)
     {
         printf("[%d] sufficient number of clients reached\n", workerArgs->id);
+        printf("[%d] waiting for this thread's turn to communicate with its' client\n", workerArgs->id);
+
+        if (pthread_mutex_lock(workerArgs->mutex) != 0)
+            ERR("pthread_mutex_lock");
+        if (shouldQuit)
+        {
+            if (pthread_mutex_unlock(workerArgs->mutex) != 0)
+                ERR("pthread_mutex_unlock");
+            if (pthread_cond_signal(workerArgs->cond) != 0)
+                ERR("pthread_cond_signal");
+            goto cleanup;
+        }
+        if (*(workerArgs->communicatingWithClient) == 1)
+        {
+            if (pthread_cond_wait(workerArgs->cond, workerArgs->mutex) != 0)
+                ERR("pthread_cond_wait");
+        }
+
+        if (shouldQuit)
+        {
+            if (pthread_mutex_unlock(workerArgs->mutex) != 0)
+                ERR("pthread_mutex_unlock");
+            if (pthread_cond_signal(workerArgs->cond) != 0)
+                ERR("pthread_cond_signal");
+            goto cleanup;
+        }
+
+        *(workerArgs->communicatingWithClient) = 1;
+        // TODO: this if may be moved just before signaling the condition variable
+        if (pthread_mutex_unlock(workerArgs->mutex) != 0)
+            ERR("pthread_mutex_unlock");
+
+        printf("[%d] beginning communication with the client\n", workerArgs->id);
+        int gotValidResponse = 0;
+        char message;
+        do {
+            if (bulkWrite(workerArgs->clientSocket, workerArgs->lastLetter, 1) != 1)
+                break;
+            if (bulkRead(workerArgs->clientSocket, &message, 1) != 1)
+                break;
+            if (message == *(workerArgs->lastLetter) + 1)
+            {
+                gotValidResponse = 1;
+                *(workerArgs->lastLetter) = message;
+            }
+        } while (!gotValidResponse);
+
+        if (gotValidResponse)
+            printf("[%d] valid response received from the client\n", workerArgs->id);
+        else
+            printf("[%d] connection broken\n", workerArgs->id);
+
+        if (pthread_mutex_lock(workerArgs->mutex) != 0)
+            ERR("pthread_mutex_lock");
+        *(workerArgs->communicatingWithClient) = 0;
+        if (pthread_mutex_unlock(workerArgs->mutex) != 0)
+            ERR("pthread_mutex_unlock");
+        if (pthread_cond_signal(workerArgs->cond) != 0)
+            ERR("pthread_cond_signal");
     }
 
     // Barrier to synchronize closing of all clients
@@ -170,16 +254,10 @@ void *workerThread(void *args)
     int barrierResult = pthread_barrier_wait(workerArgs->barrier);
     if (barrierResult != 0 && barrierResult != PTHREAD_BARRIER_SERIAL_THREAD)
         ERR("pthread_barrier_wait");
+cleanup:
     printf("[%d] Closing connection to the client\n", workerArgs->id);
     if (TEMP_FAILURE_RETRY(close(workerArgs->clientSocket)) < 0)
         ERR("close");
-    // Resetting clientsConnected is done in the main server thread
-    // if (pthread_mutex_lock(workerArgs->mutex) != 0)
-    //     ERR("pthread_mutex_lock");
-    // *(workerArgs->clientsConnected) = *(workerArgs->clientsConnected) - 1;
-    // printf("[%d] %d clients left\n", workerArgs->id, *(workerArgs->clientsConnected));
-    // if (pthread_mutex_unlock(workerArgs->mutex) != 0)
-    //     ERR("pthread_mutex_unlock");
 
     printf("[%d] terminated\n", workerArgs->id);
     free(args);
@@ -195,10 +273,15 @@ int main(int argc, char **argv)
     pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
     pthread_barrier_t barrier;
     regenerateBarrier(&barrier);
+    pthread_cond_t cond;
+    if (pthread_cond_init(&cond, NULL) != 0)
+        ERR("pthread_cond_init");
 
     int serverSocket = makeSocket(),
         clientsConnected = 0,
-        nextWorkerId = 1;
+        nextWorkerId = 1,
+        communicatingWithClient = 1;
+    char lastLetter = 'A';
     bindSocketAndListen(serverSocket, port);
     printf("[SERVER] listening on port %d\n", port);
 
@@ -221,6 +304,9 @@ int main(int argc, char **argv)
         workerArgs->mutex = &mutex;
         workerArgs->clientsConnected = &clientsConnected;
         workerArgs->barrier = &barrier;
+        workerArgs->cond = &cond;
+        workerArgs->communicatingWithClient = &communicatingWithClient;
+        workerArgs->lastLetter = &lastLetter;
 
         pthread_t tid;
         if (pthread_create(&tid, NULL, workerThread, workerArgs) != 0)
@@ -242,8 +328,14 @@ int main(int argc, char **argv)
             continue;
         }
 
+        communicatingWithClient = 0;
+        lastLetter = 'A';
+
         if (pthread_mutex_unlock(&mutex) != 0)
-                ERR("pthread_mutex_unlock");
+            ERR("pthread_mutex_unlock");
+
+        if (pthread_cond_signal(&cond) != 0)
+            ERR("pthread_cond_signal");
 
         printf("[SERVER] All required clients connected, waiting at the barrier for them to end\n");
         int barrierResult = pthread_barrier_wait(&barrier);
@@ -256,7 +348,12 @@ int main(int argc, char **argv)
         if (pthread_barrier_destroy(&barrier) != 0)
             ERR("pthread_barrier_destroy");
         regenerateBarrier(&barrier);
-        printf("[SERVER] Barrier regenerated\n");
+        communicatingWithClient = 1;
+        if (pthread_cond_destroy(&cond) != 0)
+            ERR("pthread_cond_destroy");
+        if (pthread_cond_init(&cond, NULL) != 0)
+            ERR("pthread_cond_init");
+        printf("[SERVER] Barrier and condition variable regenerated\n");
     }
 
     printf("[SERVER] cleaning up\n");
