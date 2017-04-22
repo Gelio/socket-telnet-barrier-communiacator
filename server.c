@@ -72,7 +72,7 @@ void bindSocketAndListen(int socketDes, int16_t port)
 
 void regenerateBarrier(pthread_barrier_t *barrier)
 {
-    if (pthread_barrier_init(barrier, NULL, CLIENTS_REQUIRED + 1) != 0)
+    if (pthread_barrier_init(barrier, NULL, CLIENTS_REQUIRED) != 0)
         ERR("pthread_barrier_init");
 }
 
@@ -134,6 +134,52 @@ size_t bulkWrite(int fd, char *buffer, size_t length)
     return totalBytesWritten;
 }
 
+typedef struct workerThreadNode {
+    pthread_t tid;
+    struct workerThreadNode *next;
+} workerThreadNode_t;
+
+void addWorkerThreadNode(workerThreadNode_t **head, pthread_t tid)
+{
+    workerThreadNode_t *newNode = malloc(sizeof(workerThreadNode_t));
+    if (newNode == NULL)
+        ERR("malloc");
+    newNode->tid = tid;
+    newNode->next = *head;
+    *head = newNode;
+}
+
+void removeWorkerThreadNode(workerThreadNode_t **head, pthread_t tid)
+{
+    if (*head == NULL)
+        return;
+
+    workerThreadNode_t *nodeToRemove = NULL;
+    if ((*head)->tid == tid)
+    {
+        nodeToRemove = *head;
+        *head = nodeToRemove->next;
+        free(nodeToRemove);
+        return;
+    }
+    else
+    {
+        workerThreadNode_t *currentNode = *head;
+        while (currentNode->next != NULL)
+        {
+            workerThreadNode_t *nextNode = currentNode->next;
+            if (nextNode->tid == tid)
+            {
+                nodeToRemove = nextNode;
+                currentNode->next = nextNode->next;
+                free(nodeToRemove);
+                return;
+            }
+            currentNode = nextNode;
+        }
+    }
+}
+
 typedef struct workerArgs {
     int id;
     int clientSocket;
@@ -143,11 +189,21 @@ typedef struct workerArgs {
     pthread_cond_t *cond;
     int *communicatingWithClient;
     char *lastLetter;
+    int *allClientsDone;
+    pthread_cond_t *allClientsDoneCond;
+    workerThreadNode_t **workerThreadsList;
 } workerArgs_t;
 
 void workerCleanup(void *args)
 {
     workerArgs_t *workerArgs = (workerArgs_t*)args;
+
+    if (pthread_mutex_lock(workerArgs->mutex) != 0)
+        ERR("pthread_mutex_lock");
+    removeWorkerThreadNode(workerArgs->workerThreadsList, pthread_self());
+    if (pthread_mutex_unlock(workerArgs->mutex) != 0)
+        ERR("pthread_mutex_unlock");
+
 
     if (pthread_cond_signal(workerArgs->cond) != 0)
             ERR("pthread_cond_signal");
@@ -157,6 +213,17 @@ void workerCleanup(void *args)
     int barrierResult = pthread_barrier_wait(workerArgs->barrier);
     if (barrierResult != 0 && barrierResult != PTHREAD_BARRIER_SERIAL_THREAD)
         ERR("pthread_barrier_wait");
+    if (barrierResult == PTHREAD_BARRIER_SERIAL_THREAD)
+    {
+        if (pthread_mutex_lock(workerArgs->mutex) != 0)
+            ERR("pthread_mutex_lock");
+        *(workerArgs->allClientsDone) = 1;
+        if (pthread_mutex_unlock(workerArgs->mutex) != 0)
+            ERR("pthread_mutex_unlock");
+
+        if (pthread_cond_signal(workerArgs->allClientsDoneCond) != 0)
+            ERR("pthread_cond_signal");
+    }
 
     if (TEMP_FAILURE_RETRY(close(workerArgs->clientSocket)) < 0)
         ERR("close");
@@ -285,22 +352,40 @@ void *workerThread(void *args)
     return NULL;
 }
 
-void resetServerState(int initial, pthread_barrier_t *barrier, pthread_cond_t *cond, int *clientsConnected, int *communicatingWithClient, char *lastLetter)
+void resetServerState(int initial, pthread_barrier_t *barrier, pthread_cond_t *cond, int *clientsConnected, int *communicatingWithClient, char *lastLetter, int *allClientsDone, pthread_cond_t *allClientsDoneCond)
 {
     *clientsConnected = 0;
+
     if (!initial && pthread_barrier_destroy(barrier) != 0)
         ERR("pthread_barrier_destroy");
     regenerateBarrier(barrier);
+
     *communicatingWithClient = 1;
     if (!initial && pthread_cond_destroy(cond) != 0)
         ERR("pthread_cond_destroy");
     if (pthread_cond_init(cond, NULL) != 0)
         ERR("pthread_cond_init");
+
     *lastLetter = 'A';
+
+    *allClientsDone = 0;
+    if (!initial && pthread_cond_destroy(allClientsDoneCond) != 0)
+        ERR("pthread_cond_destroy");
+    if (pthread_cond_init(allClientsDoneCond, NULL) != 0)
+        ERR("pthread_cond_init");
+}
+
+void threadBlockSigint()
+{
+    sigset_t blockMask;
+    sigemptyset(&blockMask);
+    sigaddset(&blockMask, SIGINT);
+    if (pthread_sigmask(SIG_BLOCK, &blockMask, NULL) != 0)
+        ERR("pthread_sigmask");
 }
 
 pthread_t createWorkerThread(int clientSocket, pthread_mutex_t *mutex, int *clientsConnected, pthread_barrier_t *barrier, pthread_cond_t *cond,
-    int *communicatingWithClient, char *lastLetter)
+    int *communicatingWithClient, char *lastLetter, workerThreadNode_t **workerThreadsList)
 {
     static int nextWorkerId = 1;
 
@@ -316,27 +401,30 @@ pthread_t createWorkerThread(int clientSocket, pthread_mutex_t *mutex, int *clie
     workerArgs->cond = cond;
     workerArgs->communicatingWithClient = communicatingWithClient;
     workerArgs->lastLetter = lastLetter;
+    workerArgs->workerThreadsList = workerThreadsList;
 
     pthread_t tid;
     if (pthread_create(&tid, NULL, workerThread, workerArgs) != 0)
         ERR("pthread_create");
     if (pthread_detach(tid) != 0)
         ERR("pthread_detach");
-    // TODO: block sigint for this thread
+    threadBlockSigint();
 
     return tid;
 }
 
 void serverMainLoop(int serverSocket)
 {
-    // TODO: cancel all threads upon SIGINT
+    workerThreadNode_t *workerThreadsList = NULL;
     pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
     pthread_barrier_t barrier;
-    pthread_cond_t cond;
+    pthread_cond_t cond,
+        allClientsDoneCond;
     int clientsConnected = 0,
-        communicatingWithClient = 1;
+        communicatingWithClient = 1,
+        allClientsDone = 0;
     char lastLetter = 'A';
-    resetServerState(1, &barrier, &cond, &clientsConnected, &communicatingWithClient, &lastLetter);
+    resetServerState(1, &barrier, &cond, &clientsConnected, &communicatingWithClient, &lastLetter, &allClientsDone, &allClientsDoneCond);
 
     while (!shouldQuit)
     {
@@ -348,10 +436,12 @@ void serverMainLoop(int serverSocket)
             ERR("accept");
         }
         printf("[SERVER] new client connected\n");
-        createWorkerThread(clientSocket, &mutex, &clientsConnected, &barrier, &cond, &communicatingWithClient, &lastLetter);
+        pthread_t tid = createWorkerThread(clientSocket, &mutex, &clientsConnected, &barrier, &cond, &communicatingWithClient, &lastLetter, &workerThreadsList);
 
         if (pthread_mutex_lock(&mutex) != 0)
             ERR("pthread_mutex_lock");
+        addWorkerThreadNode(&workerThreadsList, tid);
+
         clientsConnected++;
 
         if (clientsConnected < CLIENTS_REQUIRED)
@@ -371,16 +461,32 @@ void serverMainLoop(int serverSocket)
         if (pthread_cond_signal(&cond) != 0)
             ERR("pthread_cond_signal");
 
-        // TODO: create a dedicated cond variable for the main thread to continue
-        // Signal it after the barrier (of 1 less height than the current one) is reached
-        printf("[SERVER] barrier wait\n");
-        int barrierResult = pthread_barrier_wait(&barrier);
-        if (barrierResult != 0 && barrierResult != PTHREAD_BARRIER_SERIAL_THREAD)
-            ERR("pthread_barrier_wait");
+        printf("[SERVER] waiting for clients\n");
+        if (pthread_mutex_lock(&mutex) != 0)
+            ERR("pthread_mutex_lock");
+
+        if (pthread_cond_wait(&allClientsDoneCond, &mutex) != 0)
+            ERR("pthread_cond_wait");
+
+        workerThreadNode_t *currentWorkerThreadNode = workerThreadsList;
+        while (currentWorkerThreadNode != NULL)
+        {
+            if (pthread_cancel(currentWorkerThreadNode->tid) != 0)
+                ERR("pthread_cancel");
+            currentWorkerThreadNode = currentWorkerThreadNode->next;
+        }
+
+        if (pthread_mutex_unlock(&mutex) != 0)
+            ERR("pthread_mutex_unlock");
+
+        // printf("[SERVER] barrier wait\n");
+        // int barrierResult = pthread_barrier_wait(&barrier);
+        // if (barrierResult != 0 && barrierResult != PTHREAD_BARRIER_SERIAL_THREAD)
+        //     ERR("pthread_barrier_wait");
 
         // No need to lock mutexes, because all threads are terminating right now (and won't modify
         // shared data)
-        resetServerState(0, &barrier, &cond, &clientsConnected, &communicatingWithClient, &lastLetter);
+        resetServerState(0, &barrier, &cond, &clientsConnected, &communicatingWithClient, &lastLetter, &allClientsDone, &allClientsDoneCond);
     }
 
     printf("[SERVER] cleaning up\n");
